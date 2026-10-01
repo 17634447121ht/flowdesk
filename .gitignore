@@ -1,0 +1,9 @@
+*.exe
+*.dll
+*.pdb
+bin/
+obj/
+*.log
+usage.xml
+usage.xml.*
+.vs/
