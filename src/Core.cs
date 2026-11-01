@@ -1,17 +1,22 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Net.NetworkInformation;
+using System.Runtime.InteropServices;
+using System.Threading;
 using System.Xml;
 using System.Xml.Serialization;
 
 namespace FlowDesk
 {
+    public enum DisplayMode { UltraMinimal, Minimal, Detailed }
+
     public sealed class AppSettings
     {
+        private DisplayMode mode;
         public string AdapterId { get; set; }
         public double QuotaGB { get; set; }
         public int BillingDay { get; set; }
@@ -22,6 +27,22 @@ namespace FlowDesk
         public double Top { get; set; }
         public double Width { get; set; }
         public double Height { get; set; }
+        public bool HasSavedPosition { get; set; }
+        // Keep the old XML field readable by earlier releases. Mode follows it
+        // in newly saved files, and ReadStore restores Mode independently of order.
+        public bool DesktopWidgetEnabled
+        {
+            get { return mode == DisplayMode.Detailed; }
+            set { mode = value ? DisplayMode.Detailed : DisplayMode.UltraMinimal; }
+        }
+        public DisplayMode Mode { get { return mode; } set { mode = value; } }
+        public double MinimalLeft { get; set; }
+        public double MinimalTop { get; set; }
+        public bool HasMinimalPosition { get; set; }
+        public bool MinimalLocked { get; set; }
+        public bool MinimalClickThrough { get; set; }
+        public string MinimalTextTheme { get; set; }
+        public bool MinimalTextShadow { get; set; }
 
         public AppSettings()
         {
@@ -32,7 +53,12 @@ namespace FlowDesk
             Left = -1;
             Top = -1;
             Width = 286;
-            Height = 220;
+            Height = 240;
+            Mode = DisplayMode.Minimal;
+            MinimalLeft = -1;
+            MinimalTop = -1;
+            MinimalTextTheme = "auto";
+            MinimalTextShadow = true;
         }
 
         public AppSettings Clone()
@@ -68,6 +94,8 @@ namespace FlowDesk
         public DateTime StartedOn { get; set; }
         public string AdapterLabel { get; set; }
         public string Status { get; set; }
+        public bool IsMonitoringAvailable { get; set; }
+        public DateTime SampledAt { get; set; }
         public List<UsageDay> History { get; set; }
     }
 
@@ -115,21 +143,32 @@ namespace FlowDesk
         private readonly string dataPath;
         private readonly Dictionary<string, UsageDay> days = new Dictionary<string, UsageDay>(StringComparer.Ordinal);
         private readonly Dictionary<string, Baseline> baselines = new Dictionary<string, Baseline>(StringComparer.OrdinalIgnoreCase);
-        private readonly HashSet<string> physicalIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, bool> hardwareAdapters = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
         private UsageStore store;
-        private bool physicalInformationAvailable;
         private bool dirty;
         private bool preserveBadPrimary;
+        private bool preserveBadBackup;
+        private bool backupWasRecovered;
         private bool disposed;
         private long lastSaveStamp;
         private long lastAdapterRefresh;
         private string lastSelection;
         private string lastStorageError;
+        private string recoveryNotice;
+        private readonly AutoResetEvent saveSignal = new AutoResetEvent(false);
+        private readonly object saveSync = new object();
+        private readonly Thread saveThread;
+        private UsageStore pendingSave;
+        private long queuedSaveVersion;
+        private long attemptedSaveVersion;
+        private bool stopSaving;
+        private bool forceSave;
 
         public event Action<int> QuotaReached;
         public AppSettings Settings { get { return store.Settings; } }
         public DateTime StartedOn { get { return store.StartedOn; } }
-        public string LastStorageError { get { return lastStorageError; } }
+        public string LastStorageError { get { lock (saveSync) return lastStorageError; } }
+        public string RecoveryNotice { get { return recoveryNotice; } }
 
         public TrafficMonitor(string dataDir)
         {
@@ -137,14 +176,13 @@ namespace FlowDesk
             dataDirectory = Path.GetFullPath(dataDir);
             dataPath = Path.Combine(dataDirectory, "usage.xml");
             Load();
-            // NetworkInterface enumeration is synchronous and fast. Some Windows
-            // builds have a StandardCimv2 WMI provider that can block for minutes;
-            // the widget must still start when that optional provider is unavailable.
-            // IsPhysical below therefore uses the stable interface type plus a
-            // conservative virtual-adapter name filter.
+            // Use native local metadata rather than WMI, whose optional providers
+            // can block startup for minutes on some Windows builds.
             RefreshPhysicalAdapters();
             lastSaveStamp = Stopwatch.GetTimestamp();
             lastSelection = store.Settings.AdapterId;
+            saveThread = new Thread(SaveLoop) { IsBackground = true, Name = "FlowDesk storage" };
+            saveThread.Start();
         }
 
         public List<AdapterChoice> RefreshAdapters()
@@ -302,6 +340,8 @@ namespace FlowDesk
                     StartedOn = store.StartedOn,
                     AdapterLabel = label,
                     Status = status,
+                    IsMonitoringAvailable = anyCounter,
+                    SampledAt = now,
                     History = CopyDays()
                 };
                 foreach (UsageDay day in snapshot.History)
@@ -413,54 +453,165 @@ namespace FlowDesk
             return level;
         }
 
+        /// <summary>Queues an immutable snapshot; disk access runs on one storage thread.</summary>
         public void Save()
         {
             lock (sync)
             {
                 if (disposed) return;
-                string temporary = null;
-                try
+                NormalizeSettings(store.Settings);
+                UsageStore copy = new UsageStore
                 {
-                    Directory.CreateDirectory(dataDirectory);
-                    NormalizeSettings(store.Settings);
-                    store.Days = CopyDays();
-                    temporary = Path.Combine(dataDirectory, "usage." + Guid.NewGuid().ToString("N") + ".tmp");
-                    XmlSerializer serializer = new XmlSerializer(typeof(UsageStore));
-                    using (FileStream stream = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None))
-                    {
-                        serializer.Serialize(stream, store);
-                        stream.Flush(true);
-                    }
-                    if (File.Exists(dataPath))
-                    {
-                        string backup = preserveBadPrimary ? dataPath + ".damaged-" + DateTime.UtcNow.ToString("yyyyMMddHHmmssfff", CultureInfo.InvariantCulture) : dataPath + ".bak";
-                        File.Replace(temporary, dataPath, backup, true);
-                    }
-                    else File.Move(temporary, dataPath);
-                    temporary = null;
-                    preserveBadPrimary = false;
-                    dirty = false;
-                    lastSaveStamp = Stopwatch.GetTimestamp();
-                    lastStorageError = null;
+                    Version = store.Version,
+                    StartedOn = store.StartedOn,
+                    Settings = store.Settings.Clone(),
+                    Days = CopyDays(),
+                    Notices = store.Notices.Select(n => new QuotaNotice { Key = n.Key, Level = n.Level }).ToList()
+                };
+                lock (saveSync)
+                {
+                    pendingSave = copy;
+                    queuedSaveVersion++;
                 }
-                catch (Exception error)
+                dirty = false;
+                lastSaveStamp = Stopwatch.GetTimestamp();
+                saveSignal.Set();
+            }
+        }
+
+        /// <summary>Waits for currently queued data to be attempted once. Errors remain visible and retry in the background.</summary>
+        public void Flush()
+        {
+            lock (saveSync)
+            {
+                long target = queuedSaveVersion;
+                forceSave = true;
+                saveSignal.Set();
+                while (attemptedSaveVersion < target) Monitor.Wait(saveSync);
+            }
+        }
+
+        private void SaveLoop()
+        {
+            UsageStore retry = null;
+            long retryVersion = 0;
+            int failures = 0;
+            DateTime retryAt = DateTime.MinValue;
+            while (true)
+            {
+                bool stopping;
+                lock (saveSync)
                 {
-                    if (!(error is IOException || error is UnauthorizedAccessException || error is InvalidOperationException || error is System.Security.SecurityException)) throw;
-                    lastStorageError = "保存失败：" + error.Message;
-                    dirty = true;
-                }
-                finally
-                {
-                    if (temporary != null)
+                    stopping = stopSaving;
+                    if (forceSave) { retryAt = DateTime.MinValue; forceSave = false; }
+                    if (pendingSave != null)
                     {
-                        try { if (File.Exists(temporary)) File.Delete(temporary); }
-                        catch (IOException) { }
-                        catch (UnauthorizedAccessException) { }
+                        retry = pendingSave;
+                        retryVersion = queuedSaveVersion;
+                        pendingSave = null;
                     }
+                }
+                if (retry == null)
+                {
+                    if (stopping) return;
+                    saveSignal.WaitOne();
+                    continue;
+                }
+                // A stream of new samples must not defeat the failure backoff.
+                if (!stopping && DateTime.UtcNow < retryAt)
+                {
+                    int delay = (int)Math.Min(60000, Math.Max(1, (retryAt - DateTime.UtcNow).TotalMilliseconds));
+                    saveSignal.WaitOne(delay);
+                    continue;
+                }
+                string error = WriteStore(retry);
+                lock (saveSync)
+                {
+                    lastStorageError = error;
+                    attemptedSaveVersion = Math.Max(attemptedSaveVersion, retryVersion);
+                    Monitor.PulseAll(saveSync);
+                    stopping = stopSaving;
+                    if (error == null)
+                    {
+                        retry = null;
+                        failures = 0;
+                        retryAt = DateTime.MinValue;
+                    }
+                    else
+                    {
+                        failures = Math.Min(failures + 1, 6);
+                        retryAt = DateTime.UtcNow.AddSeconds(Math.Min(60, Math.Pow(2, failures)));
+                    }
+                    // On exit, make one final attempt on the newest queued snapshot,
+                    // then terminate even if the destination remains unwritable.
+                    if (stopping && pendingSave == null) return;
                 }
             }
         }
 
+        private string WriteStore(UsageStore snapshot)
+        {
+            string temporary = null;
+            try
+            {
+                Directory.CreateDirectory(dataDirectory);
+                // Preserve both invalid inputs before either is replaced. A unique
+                // suffix also avoids collisions after rapid restarts.
+                if (preserveBadBackup && File.Exists(dataPath + ".bak"))
+                {
+                    File.Copy(dataPath + ".bak", ArchivePath(dataPath + ".bak", backupWasRecovered ? ".recovered-" : ".damaged-"));
+                    preserveBadBackup = false;
+                }
+                temporary = Path.Combine(dataDirectory, "usage." + Guid.NewGuid().ToString("N") + ".tmp");
+                XmlSerializer serializer = new XmlSerializer(typeof(UsageStore));
+                using (FileStream stream = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                {
+                    serializer.Serialize(stream, snapshot);
+                    stream.Flush(true);
+                }
+                if (File.Exists(dataPath))
+                {
+                    string backup = preserveBadPrimary ? DamagedPath(dataPath) : dataPath + ".bak";
+                    File.Replace(temporary, dataPath, backup, true);
+                }
+                else File.Move(temporary, dataPath);
+                temporary = null;
+                preserveBadPrimary = false;
+                return null;
+            }
+            catch (Exception error)
+            {
+                if (!(error is IOException || error is UnauthorizedAccessException || error is InvalidOperationException || error is System.Security.SecurityException))
+                    LogStorageError(error);
+                return "保存失败：" + error.Message;
+            }
+            finally
+            {
+                if (temporary != null)
+                {
+                    try { if (File.Exists(temporary)) File.Delete(temporary); }
+                    catch (Exception cleanupError) { LogStorageError(cleanupError); }
+                }
+            }
+        }
+
+        private static string DamagedPath(string path)
+        {
+            return ArchivePath(path, ".damaged-");
+        }
+
+        private static string ArchivePath(string path, string suffix)
+        {
+            return path + suffix + DateTime.UtcNow.ToString("yyyyMMddHHmmssfff", CultureInfo.InvariantCulture) + "-" + Guid.NewGuid().ToString("N");
+        }
+
+        private void LogStorageError(Exception error)
+        {
+            // Keep Core independently testable; unexpected storage errors must not
+            // take down the background thread or leave Flush waiting indefinitely.
+            try { File.AppendAllText(Path.Combine(dataDirectory, "errors.log"), DateTime.Now.ToString("s") + " " + error + Environment.NewLine); }
+            catch { }
+        }
         private void Load()
         {
             store = null;
@@ -471,7 +622,7 @@ namespace FlowDesk
                 {
                     if (!(error is IOException || error is UnauthorizedAccessException || error is InvalidOperationException || error is XmlException || error is FormatException)) throw;
                     preserveBadPrimary = true;
-                    lastStorageError = "统计文件读取失败，正在尝试备份。";
+                    recoveryNotice = "统计文件读取失败，已保留原文件并尝试备份。";
                 }
             }
             if (store == null && File.Exists(dataPath + ".bak"))
@@ -479,12 +630,15 @@ namespace FlowDesk
                 try
                 {
                     store = ReadStore(dataPath + ".bak");
-                    lastStorageError = "已从上一次备份恢复统计；最近一次保存的数据可能缺失。";
+                    preserveBadBackup = true;
+                    backupWasRecovered = true;
+                    recoveryNotice = "已从上一次备份恢复统计；最近一次保存的数据可能缺失。原文件和恢复所用备份会另存保留。";
                 }
                 catch (Exception error)
                 {
                     if (!(error is IOException || error is UnauthorizedAccessException || error is InvalidOperationException || error is XmlException || error is FormatException)) throw;
-                    lastStorageError = "统计文件及备份无法读取；原文件将保留为 damaged 文件。";
+                    preserveBadBackup = true;
+                    recoveryNotice = "统计文件及备份无法读取，已开始新的统计；两个原文件都将另存为 damaged 文件。";
                 }
             }
             if (store == null) store = new UsageStore();
@@ -508,9 +662,44 @@ namespace FlowDesk
             using (FileStream stream = File.OpenRead(path))
             using (XmlReader reader = XmlReader.Create(stream, options))
             {
-                UsageStore result = (UsageStore)new XmlSerializer(typeof(UsageStore)).Deserialize(reader);
+                // XmlSerializer runs constructors first. Checking the resulting
+                // object alone accepts <UsageStore/> as a fresh, empty history.
+                XmlDocument document = new XmlDocument { XmlResolver = null };
+                document.Load(reader);
+                XmlElement root = document.DocumentElement;
+                if (root == null || root.Name != "UsageStore") throw new FormatException("Invalid statistics root.");
+                foreach (string required in new[] { "Version", "StartedOn", "Settings", "Days" })
+                    if (root.SelectNodes(required).Count != 1) throw new FormatException("Missing or duplicate statistics field: " + required);
+                foreach (XmlNode entry in root.SelectSingleNode("Days").ChildNodes)
+                {
+                    if (entry.NodeType != XmlNodeType.Element) continue;
+                    if (entry.Name != "UsageDay") throw new FormatException("Invalid daily statistics entry.");
+                    foreach (string required in new[] { "Date", "Download", "Upload" })
+                        if (entry.SelectNodes(required).Count != 1) throw new FormatException("Missing or duplicate daily statistics field: " + required);
+                }
+                XmlNode modeNode = root.SelectSingleNode("Settings/Mode");
+                DisplayMode savedMode = DisplayMode.Minimal;
+                bool validMode = modeNode != null && Enum.TryParse<DisplayMode>(modeNode.InnerText, false, out savedMode)
+                    && Enum.IsDefined(typeof(DisplayMode), savedMode);
+                // An invalid optional display preference must not discard valid
+                // traffic history just because XmlSerializer cannot parse an enum.
+                if (modeNode != null) modeNode.InnerText = validMode ? savedMode.ToString() : DisplayMode.Minimal.ToString();
+                UsageStore result;
+                using (XmlNodeReader validated = new XmlNodeReader(document))
+                    result = (UsageStore)new XmlSerializer(typeof(UsageStore)).Deserialize(validated);
                 if (result == null || result.Version != 1 || result.Settings == null || result.Days == null)
                     throw new FormatException("Unsupported or incomplete statistics file.");
+                if (result.StartedOn == DateTime.MinValue) throw new FormatException("Invalid statistics start date.");
+                if (modeNode == null)
+                    result.Settings.Mode = result.Settings.DesktopWidgetEnabled ? DisplayMode.Detailed : DisplayMode.UltraMinimal;
+                else
+                    result.Settings.Mode = (DisplayMode)Enum.Parse(typeof(DisplayMode), modeNode.InnerText, false);
+                if (root.SelectSingleNode("Settings/HasSavedPosition") == null)
+                {
+                    double left = result.Settings.Left, top = result.Settings.Top;
+                    result.Settings.HasSavedPosition = !Double.IsNaN(left) && !Double.IsInfinity(left) &&
+                        !Double.IsNaN(top) && !Double.IsInfinity(top) && (left != -1 || top != -1);
+                }
                 foreach (UsageDay day in result.Days)
                 {
                     DateTime parsed;
@@ -536,23 +725,24 @@ namespace FlowDesk
             if (Double.IsNaN(value.QuotaGB) || Double.IsInfinity(value.QuotaGB) || value.QuotaGB < 0) value.QuotaGB = 0;
             if (Double.IsNaN(value.Opacity) || Double.IsInfinity(value.Opacity)) value.Opacity = 0.94;
             value.Opacity = Math.Max(0.35, Math.Min(1, value.Opacity));
-            if (Double.IsNaN(value.Left) || Double.IsInfinity(value.Left)) value.Left = -1;
-            if (Double.IsNaN(value.Top) || Double.IsInfinity(value.Top)) value.Top = -1;
+            if (Double.IsNaN(value.Left) || Double.IsInfinity(value.Left)) { value.Left = -1; value.HasSavedPosition = false; }
+            if (Double.IsNaN(value.Top) || Double.IsInfinity(value.Top)) { value.Top = -1; value.HasSavedPosition = false; }
+            if (!Enum.IsDefined(typeof(DisplayMode), value.Mode)) value.Mode = DisplayMode.Minimal;
+            if (Double.IsNaN(value.MinimalLeft) || Double.IsInfinity(value.MinimalLeft)) { value.MinimalLeft = -1; value.HasMinimalPosition = false; }
+            if (Double.IsNaN(value.MinimalTop) || Double.IsInfinity(value.MinimalTop)) { value.MinimalTop = -1; value.HasMinimalPosition = false; }
+            value.MinimalTextTheme = (value.MinimalTextTheme ?? "auto").Trim().ToLowerInvariant();
+            if (value.MinimalTextTheme != "light" && value.MinimalTextTheme != "dark") value.MinimalTextTheme = "auto";
             if (Double.IsNaN(value.Width) || Double.IsInfinity(value.Width) || value.Width <= 0) value.Width = 286;
-            if (Double.IsNaN(value.Height) || Double.IsInfinity(value.Height) || value.Height <= 0) value.Height = 220;
-            value.Width = Math.Max(230, Math.Min(900, value.Width));
-            value.Height = Math.Max(120, Math.Min(700, value.Height));
+            if (Double.IsNaN(value.Height) || Double.IsInfinity(value.Height) || value.Height <= 0) value.Height = 240;
+            value.Width = Math.Max(286, Math.Min(900, value.Width));
+            value.Height = Math.Max(240, Math.Min(700, value.Height));
         }
 
         private void RefreshPhysicalAdapters()
         {
-            // Do not block startup on WMI. The Windows network-information API
-            // exposes stable media types, and IsFilter/name checks below remove
-            // common VPN, VM, tunnel and packet-filter interfaces. An explicit
-            // adapter selection remains available when a driver uses an unusual
-            // description.
-            physicalIds.Clear();
-            physicalInformationAvailable = false;
+            // GetIfEntry2 reads local interface metadata without the blocking WMI
+            // provider. Cache per adapter, and refresh for hotplug/driver changes.
+            hardwareAdapters.Clear();
             lastAdapterRefresh = Stopwatch.GetTimestamp();
         }
 
@@ -560,9 +750,11 @@ namespace FlowDesk
         {
             if (adapter.NetworkInterfaceType == NetworkInterfaceType.Loopback || adapter.NetworkInterfaceType == NetworkInterfaceType.Tunnel || IsFilter(adapter)) return false;
             string words = (adapter.Name + " " + adapter.Description).ToLowerInvariant();
+            if (words.Contains("bluetooth") || words.Contains("蓝牙")) return false;
+            bool hardware;
+            if (TryGetHardwareAdapter(adapter, out hardware)) return hardware;
             string[] virtualWords = { "virtual", "vmware", "vmnet", "vethernet", "hyper-v", "tunnel", "tap-", "tap ", "tun ", "wintun", "wireguard", "vpn", "mihomo", "clash", "tailscale", "zerotier", "docker", "container", "npcap", "loopback", "bluetooth", "虚拟", "蓝牙" };
             if (virtualWords.Any(words.Contains)) return false;
-            if (physicalInformationAvailable) return physicalIds.Contains(NormalizeId(adapter.Id));
             // Safe fallback when the optional WMI provider is unavailable. Ethernet
             // and 802.11 are the media types exposed by physical LAN/Wi-Fi drivers;
             // known virtual/tunnel names were excluded above.
@@ -579,13 +771,63 @@ namespace FlowDesk
             }
         }
 
+        // Native MIB_IF_ROW2 layout. IF_MAX_STRING_SIZE is 256 plus its terminator.
+        // Reference: learn.microsoft.com/windows/win32/api/netioapi/ns-netioapi-mib_if_row2
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct NativeInterfaceRow
+        {
+            public ulong Luid;
+            public uint Index;
+            public Guid InterfaceGuid;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 257)] public string Alias;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 257)] public string Description;
+            public uint PhysicalAddressLength;
+            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 32)] public byte[] PhysicalAddress;
+            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 32)] public byte[] PermanentPhysicalAddress;
+            public uint Mtu, Type, TunnelType, MediaType, PhysicalMediumType, AccessType, DirectionType;
+            public byte Flags;
+            public uint OperStatus, AdminStatus, MediaConnectState;
+            public Guid NetworkGuid;
+            public uint ConnectionType;
+            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 20)] public ulong[] Counters;
+        }
+
+        [DllImport("iphlpapi.dll")]
+        private static extern uint GetIfEntry2(ref NativeInterfaceRow row);
+
+        private bool TryGetHardwareAdapter(NetworkInterface adapter, out bool hardware)
+        {
+            if (hardwareAdapters.TryGetValue(adapter.Id, out hardware)) return true;
+            hardware = false;
+            try
+            {
+                IPInterfaceProperties properties = adapter.GetIPProperties();
+                int index = adapter.Supports(NetworkInterfaceComponent.IPv4) ? properties.GetIPv4Properties().Index : properties.GetIPv6Properties().Index;
+                NativeInterfaceRow row = new NativeInterfaceRow
+                {
+                    Index = (uint)index,
+                    PhysicalAddress = new byte[32],
+                    PermanentPhysicalAddress = new byte[32],
+                    Counters = new ulong[20]
+                };
+                if (GetIfEntry2(ref row) != 0) return false;
+                // Bit 0: HardwareInterface; bit 1: FilterInterface.
+                hardware = (row.Flags & 1) != 0 && (row.Flags & 2) == 0;
+                hardwareAdapters[adapter.Id] = hardware;
+                return true;
+            }
+            catch (NetworkInformationException) { return false; }
+            catch (NotSupportedException) { return false; }
+            catch (DllNotFoundException) { return false; }
+            catch (EntryPointNotFoundException) { return false; }
+        }
+
         private static bool IsFilter(NetworkInterface adapter)
         {
             string words = (adapter.Name + " " + adapter.Description).ToLowerInvariant();
             return words.Contains("wfp") || words.Contains("qos packet") || words.Contains("native mac layer") || words.Contains("filter") || words.Contains("筛选") || words.Contains("调度程序");
         }
 
-        private static string NormalizeId(string id) { return (id ?? "").Trim().Trim('{', '}'); }
         private static DateTime ParseDate(string value) { return DateTime.ParseExact(value, "yyyy-MM-dd", CultureInfo.InvariantCulture); }
         private static double SecondsBetween(long earlier, long later) { return (later - earlier) / (double)Stopwatch.Frequency; }
         private static long SaturatingAdd(long left, long right) { return right > Int64.MaxValue - left ? Int64.MaxValue : left + right; }
@@ -600,6 +842,10 @@ namespace FlowDesk
                 disposed = true;
                 baselines.Clear();
             }
+            lock (saveSync) stopSaving = true;
+            saveSignal.Set();
+            saveThread.Join();
+            saveSignal.Dispose();
         }
     }
 }

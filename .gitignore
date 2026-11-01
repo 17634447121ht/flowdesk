@@ -7,3 +7,6 @@ obj/
 usage.xml
 usage.xml.*
 .vs/
+*.previous
+process-usage.xml*
+FlowDesk-updated.exe.config
